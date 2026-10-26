@@ -1,4 +1,4 @@
-# StellarVille SmartContracts — Technical Architecture
+# StellarVille SmartContracts: Technical Architecture
 
 ---
 

@@ -1,4 +1,4 @@
-# StellarVille — SmartContracts 🏛️⛓️
+# StellarVille: SmartContracts 🏛️⛓️
 
 > **On-Chain Sovereign Nation Protocol for Autonomous AI Agents on Stellar (Soroban)**
 
