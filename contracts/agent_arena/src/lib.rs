@@ -20,6 +20,10 @@ pub enum ArenaError {
     MarketNotResolved = 11,
     NoWinningStake = 12,
     AlreadyClaimed = 13,
+    DuelNotFound = 14,
+    DuelAlreadyMatched = 15,
+    DuelNotMatched = 16,
+    CannotDuelSelf = 17,
 }
 
 #[contracttype]
@@ -75,6 +79,27 @@ pub struct CandidateBet {
 }
 
 #[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum DuelStatus {
+    Open = 0,
+    Matched = 1,
+    Resolved = 2,
+    Cancelled = 3,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentDuel {
+    pub duel_id: u32,
+    pub challenger: Address,
+    pub opponent: Option<Address>,
+    pub stake_stroops: i128,
+    pub winner: Option<Address>,
+    pub status: DuelStatus,
+}
+
+#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HouseLiquidityPool {
     pub total_liquidity_stroops: i128,
@@ -103,6 +128,7 @@ pub enum DataKey {
     Lottery(u32),
     ElectionMarket(u32),
     Bet(u32, Address),
+    Duel(u32),
 }
 
 #[contract]
@@ -325,6 +351,127 @@ impl AgentArenaContract {
     pub fn get_house_reserve(e: Env) -> i128 {
         e.storage().instance().get(&DataKey::HouseReserve).unwrap_or(0)
     }
+
+    pub fn create_duel(
+        e: Env,
+        challenger: Address,
+        duel_id: u32,
+        stake_stroops: i128,
+    ) -> Result<(), ArenaError> {
+        challenger.require_auth();
+        if stake_stroops <= 0 {
+            return Err(ArenaError::InvalidWagerAmount);
+        }
+        let key = DataKey::Duel(duel_id);
+        let duel = AgentDuel {
+            duel_id,
+            challenger: challenger.clone(),
+            opponent: None,
+            stake_stroops,
+            winner: None,
+            status: DuelStatus::Open,
+        };
+        e.storage().persistent().set(&key, &duel);
+
+        e.events().publish(
+            (symbol_short!("arena"), symbol_short!("duel_crt")),
+            (duel_id, challenger, stake_stroops),
+        );
+        Ok(())
+    }
+
+    pub fn accept_duel(
+        e: Env,
+        opponent: Address,
+        duel_id: u32,
+    ) -> Result<(), ArenaError> {
+        opponent.require_auth();
+        let key = DataKey::Duel(duel_id);
+        let mut duel: AgentDuel = e
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ArenaError::DuelNotFound)?;
+
+        if duel.status != DuelStatus::Open {
+            return Err(ArenaError::DuelAlreadyMatched);
+        }
+        if duel.challenger == opponent {
+            return Err(ArenaError::CannotDuelSelf);
+        }
+
+        duel.opponent = Some(opponent.clone());
+        duel.status = DuelStatus::Matched;
+        e.storage().persistent().set(&key, &duel);
+
+        e.events().publish(
+            (symbol_short!("arena"), symbol_short!("duel_acc")),
+            (duel_id, opponent),
+        );
+        Ok(())
+    }
+
+    pub fn resolve_duel(
+        e: Env,
+        duel_id: u32,
+    ) -> Result<Address, ArenaError> {
+        let key = DataKey::Duel(duel_id);
+        let mut duel: AgentDuel = e
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ArenaError::DuelNotFound)?;
+
+        if duel.status != DuelStatus::Matched {
+            return Err(ArenaError::DuelNotMatched);
+        }
+        let opponent = duel.opponent.clone().ok_or(ArenaError::DuelNotMatched)?;
+
+        let coin = e.prng().gen_range::<u64>(0..2);
+        let winner = if coin == 0 {
+            duel.challenger.clone()
+        } else {
+            opponent
+        };
+
+        duel.winner = Some(winner.clone());
+        duel.status = DuelStatus::Resolved;
+        e.storage().persistent().set(&key, &duel);
+
+        let payout = (duel.stake_stroops * 2 * 97) / 100;
+        e.events().publish(
+            (symbol_short!("arena"), symbol_short!("duel_res")),
+            (duel_id, winner.clone(), payout),
+        );
+        Ok(winner)
+    }
+
+    pub fn cancel_duel(
+        e: Env,
+        challenger: Address,
+        duel_id: u32,
+    ) -> Result<(), ArenaError> {
+        challenger.require_auth();
+        let key = DataKey::Duel(duel_id);
+        let mut duel: AgentDuel = e
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ArenaError::DuelNotFound)?;
+
+        if duel.challenger != challenger || duel.status != DuelStatus::Open {
+            return Err(ArenaError::DuelAlreadyMatched);
+        }
+
+        duel.status = DuelStatus::Cancelled;
+        e.storage().persistent().set(&key, &duel);
+        Ok(())
+    }
+
+    pub fn get_duel(e: Env, duel_id: u32) -> Option<AgentDuel> {
+        e.storage().persistent().get(&DataKey::Duel(duel_id))
+    }
+
 
     pub fn init_election_market(e: Env, term: u32) -> Result<(), ArenaError> {
         let key = DataKey::ElectionMarket(term);
@@ -636,6 +783,37 @@ mod test {
 
         let winnings = client.claim_prediction_winnings(&alice, &1);
         assert_eq!(winnings, 180_000);
+    }
+
+
+    #[test]
+    fn test_head_to_head_agent_duel() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let contract_id = e.register_contract(None, AgentArenaContract);
+        let client = AgentArenaContractClient::new(&e, &contract_id);
+
+        let alice = Address::generate(&e);
+        let bob = Address::generate(&e);
+
+        client.create_duel(&alice, &1, &100_000);
+        let duel = client.get_duel(&1).unwrap();
+        assert_eq!(duel.stake_stroops, 100_000);
+        assert_eq!(duel.status, DuelStatus::Open);
+
+        assert!(client.try_accept_duel(&alice, &1).is_err());
+
+        client.accept_duel(&bob, &1);
+        let matched = client.get_duel(&1).unwrap();
+        assert_eq!(matched.status, DuelStatus::Matched);
+
+        let winner = client.resolve_duel(&1);
+        assert!(winner == alice || winner == bob);
+
+        let resolved = client.get_duel(&1).unwrap();
+        assert_eq!(resolved.status, DuelStatus::Resolved);
+        assert_eq!(resolved.winner, Some(winner));
     }
 
 }
