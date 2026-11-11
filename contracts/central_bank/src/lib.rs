@@ -19,6 +19,8 @@ pub enum BankError {
     BondAlreadyRedeemed = 10,
     AccountHealthy = 11,
     OverdueThresholdNotReached = 12,
+    BorrowPausedByCircuitBreaker = 13,
+    WithdrawalLimitExceeded = 14,
 }
 
 #[contracttype]
@@ -36,6 +38,7 @@ pub enum DataKey {
     Bond(u32),
     CreditTier,
     AccrualIndexKey,
+    CircuitBreaker,
 }
 
 #[contracttype]
@@ -54,6 +57,15 @@ pub struct LiquidationReceipt {
     pub debt_repaid: i128,
     pub collateral_seized: i128,
     pub new_credit_score: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CircuitBreakerState {
+    pub borrow_paused: bool,
+    pub max_single_withdraw_stroops: i128,
+    pub triggered_at_ledger: u32,
+    pub reason_code: u32,
 }
 
 #[contracttype]
@@ -354,6 +366,10 @@ impl CentralBankContract {
             return Err(BankError::LoanLimitExceeded);
         }
 
+        let cb = Self::get_circuit_breaker_state(e.clone());
+        if cb.borrow_paused {
+            return Err(BankError::BorrowPausedByCircuitBreaker);
+        }
         let max_borrow = Self::get_max_borrow_limit(e.clone(), borrower.clone());
         let key = DataKey::Account(borrower.clone());
         let mut account = e.storage().persistent().get(&key).unwrap_or(AccountRecord {
@@ -618,6 +634,79 @@ impl CentralBankContract {
         Ok(receipt)
     }
 
+    
+    pub fn activate_circuit_breaker(
+        e: Env,
+        governor: Address,
+        max_withdraw: i128,
+        reason_code: u32,
+    ) -> Result<(), BankError> {
+        governor.require_auth();
+        let current_gov: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::Governor)
+            .ok_or(BankError::NotInitialized)?;
+        if governor != current_gov {
+            return Err(BankError::UnauthorizedNotGovernor);
+        }
+
+        let state = CircuitBreakerState {
+            borrow_paused: true,
+            max_single_withdraw_stroops: max_withdraw,
+            triggered_at_ledger: e.ledger().sequence(),
+            reason_code,
+        };
+        e.storage().instance().set(&DataKey::CircuitBreaker, &state);
+
+        e.events().publish(
+            (symbol_short!("bank"), symbol_short!("cb_active")),
+            (e.ledger().sequence(), max_withdraw, reason_code),
+        );
+        Ok(())
+    }
+
+    pub fn deactivate_circuit_breaker(
+        e: Env,
+        governor: Address,
+    ) -> Result<(), BankError> {
+        governor.require_auth();
+        let current_gov: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::Governor)
+            .ok_or(BankError::NotInitialized)?;
+        if governor != current_gov {
+            return Err(BankError::UnauthorizedNotGovernor);
+        }
+
+        let state = CircuitBreakerState {
+            borrow_paused: false,
+            max_single_withdraw_stroops: i128::MAX,
+            triggered_at_ledger: e.ledger().sequence(),
+            reason_code: 0,
+        };
+        e.storage().instance().set(&DataKey::CircuitBreaker, &state);
+        Ok(())
+    }
+
+    pub fn get_circuit_breaker_state(e: Env) -> CircuitBreakerState {
+        let current = e.ledger().sequence();
+        if let Some(mut state) = e.storage().instance().get::<DataKey, CircuitBreakerState>(&DataKey::CircuitBreaker) {
+            if state.borrow_paused && (current > state.triggered_at_ledger + 17_280) {
+                state.borrow_paused = false;
+            }
+            state
+        } else {
+            CircuitBreakerState {
+                borrow_paused: false,
+                max_single_withdraw_stroops: i128::MAX,
+                triggered_at_ledger: 0,
+                reason_code: 0,
+            }
+        }
+    }
+
     pub fn get_rates(e: Env) -> (u32, u32) {
         let borrow_bps: u32 = e
             .storage()
@@ -716,6 +805,37 @@ mod test {
         let receipt = client.liquidate(&liquidator, &borrower, &200_000);
         assert_eq!(receipt.debt_repaid, 200_000);
         assert_eq!(receipt.new_credit_score, 500);
+    }
+
+
+    #[test]
+    fn test_economic_circuit_breaker() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let contract_id = e.register_contract(None, CentralBankContract);
+        let client = CentralBankContractClient::new(&e, &contract_id);
+
+        let gov = Address::generate(&e);
+        let asset = Address::generate(&e);
+        let alice = Address::generate(&e);
+
+        e.ledger().set_sequence_number(1_000);
+        client.initialize(&gov, &asset, &400, &250);
+
+        client.borrow(&alice, &100_000);
+
+        client.activate_circuit_breaker(&gov, &50_000, &1);
+        let cb_state = client.get_circuit_breaker_state();
+        assert!(cb_state.borrow_paused);
+
+        assert!(client.try_borrow(&alice, &50_000).is_err());
+
+        e.ledger().set_sequence_number(1_000 + 17_281);
+        let expired_state = client.get_circuit_breaker_state();
+        assert!(!expired_state.borrow_paused);
+
+        client.borrow(&alice, &50_000);
     }
 
 }
