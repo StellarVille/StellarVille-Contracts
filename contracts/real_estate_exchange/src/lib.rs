@@ -17,6 +17,11 @@ pub enum MarketError {
     TaxNotDue = 8,
     TaxDelinquent = 9,
     NotDelinquent = 10,
+    AuctionNotFound = 11,
+    AuctionEnded = 12,
+    AuctionNotEnded = 13,
+    BidTooLow = 14,
+    AuctionAlreadySettled = 15,
 }
 
 #[contracttype]
@@ -63,6 +68,18 @@ pub struct TaxAssessment {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LandAuction {
+    pub auction_id: u32,
+    pub property_id: u32,
+    pub highest_bidder: Option<Address>,
+    pub highest_bid_stroops: i128,
+    pub reserve_price_stroops: i128,
+    pub end_ledger: u32,
+    pub settled: bool,
+}
+
+#[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ItemCategory {
@@ -98,6 +115,7 @@ pub enum DataKey {
     Item(u32),
     RevenuePool(u32),
     TaxAssessment(u32),
+    Auction(u32),
 }
 
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -393,6 +411,99 @@ impl RealEstateExchangeContract {
         e.storage().persistent().get(&DataKey::Deed(property_id))
     }
 
+    pub fn start_auction(
+        e: Env,
+        auction_id: u32,
+        property_id: u32,
+        reserve_price_stroops: i128,
+        end_ledger: u32,
+    ) -> Result<LandAuction, MarketError> {
+        let key = DataKey::Auction(auction_id);
+        let auction = LandAuction {
+            auction_id,
+            property_id,
+            highest_bidder: None,
+            highest_bid_stroops: 0,
+            reserve_price_stroops,
+            end_ledger,
+            settled: false,
+        };
+        e.storage().persistent().set(&key, &auction);
+        Ok(auction)
+    }
+
+    pub fn place_bid(
+        e: Env,
+        bidder: Address,
+        auction_id: u32,
+        bid_stroops: i128,
+    ) -> Result<(), MarketError> {
+        bidder.require_auth();
+        let key = DataKey::Auction(auction_id);
+        let mut auction: LandAuction = e
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(MarketError::AuctionNotFound)?;
+
+        if e.ledger().sequence() >= auction.end_ledger {
+            return Err(MarketError::AuctionEnded);
+        }
+        if bid_stroops < auction.reserve_price_stroops || bid_stroops <= auction.highest_bid_stroops {
+            return Err(MarketError::BidTooLow);
+        }
+
+        auction.highest_bidder = Some(bidder.clone());
+        auction.highest_bid_stroops = bid_stroops;
+        e.storage().persistent().set(&key, &auction);
+
+        e.events().publish(
+            (symbol_short!("market"), symbol_short!("auc_bid")),
+            (auction_id, bidder, bid_stroops),
+        );
+        Ok(())
+    }
+
+    pub fn settle_auction(e: Env, auction_id: u32) -> Result<Option<Address>, MarketError> {
+        let key = DataKey::Auction(auction_id);
+        let mut auction: LandAuction = e
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(MarketError::AuctionNotFound)?;
+
+        if auction.settled {
+            return Err(MarketError::AuctionAlreadySettled);
+        }
+        if e.ledger().sequence() < auction.end_ledger {
+            return Err(MarketError::AuctionNotEnded);
+        }
+
+        auction.settled = true;
+        e.storage().persistent().set(&key, &auction);
+
+        if let Some(winner) = auction.highest_bidder.clone() {
+            let deed_key = DataKey::Deed(auction.property_id);
+            if let Some(mut deed) = e.storage().persistent().get::<DataKey, PropertyDeed>(&deed_key) {
+                deed.owner = winner.clone();
+                deed.for_sale = false;
+                e.storage().persistent().set(&deed_key, &deed);
+            }
+            e.events().publish(
+                (symbol_short!("market"), symbol_short!("auc_sett")),
+                (auction_id, winner.clone(), auction.highest_bid_stroops),
+            );
+            Ok(Some(winner))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_auction(e: Env, auction_id: u32) -> Option<LandAuction> {
+        e.storage().persistent().get(&DataKey::Auction(auction_id))
+    }
+
+
     pub fn assess_property_tax(
         e: Env,
         property_id: u32,
@@ -664,6 +775,51 @@ mod test {
 
         let prop = client.get_property(&prop_id).unwrap();
         assert!(prop.for_sale);
+    }
+
+
+    #[test]
+    fn test_land_auction_bidding_and_settlement() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let contract_id = e.register_contract(None, RealEstateExchangeContract);
+        let client = RealEstateExchangeContractClient::new(&e, &contract_id);
+
+        let alice = Address::generate(&e);
+        let bob = Address::generate(&e);
+        let charlie = Address::generate(&e);
+
+        let prop_id = client.register_property(
+            &alice,
+            &PropertyType::Residential,
+            &String::from_str(&e, "Lakefront Estate"),
+            &100_000,
+            &0,
+        );
+
+        e.ledger().set_sequence_number(1_000);
+        client.start_auction(&1, &prop_id, &50_000, &1_200);
+
+        client.place_bid(&bob, &1, &60_000);
+        let auc = client.get_auction(&1).unwrap();
+        assert_eq!(auc.highest_bid_stroops, 60_000);
+        assert_eq!(auc.highest_bidder, Some(bob.clone()));
+
+        client.place_bid(&charlie, &1, &75_000);
+        let auc2 = client.get_auction(&1).unwrap();
+        assert_eq!(auc2.highest_bid_stroops, 75_000);
+        assert_eq!(auc2.highest_bidder, Some(charlie.clone()));
+
+        assert!(client.try_settle_auction(&1).is_err());
+
+        e.ledger().set_sequence_number(1_201);
+        let winner = client.settle_auction(&1);
+        assert_eq!(winner, Some(charlie.clone()));
+
+        let prop = client.get_property(&prop_id).unwrap();
+        assert_eq!(prop.owner, charlie);
+        assert!(!prop.for_sale);
     }
 
 }
